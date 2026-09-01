@@ -6,7 +6,7 @@ import { IndexedChunkStore } from "./capture/indexed-chunk-store";
 import { CaptureDiagnostics } from "./capture/diagnostics";
 import { captureProgress, formatBytes, isSynthesisRequest, requestUrl } from "./capture/model";
 import { ReadAloudSessionManager } from "./capture/session-manager";
-import { playerLayoutMode } from "./player-layout";
+import { displayedAudioDuration, playerLayoutMode } from "./player-layout";
 
 (function () {
   "use strict";
@@ -451,7 +451,7 @@ import { playerLayoutMode } from "./player-layout";
 
     const isPlaying = Boolean(activeMedia && !activeMedia.paused && !activeMedia.ended);
     const current = Number(activeMedia?.currentTime) || 0;
-    const duration = Number(activeMedia?.duration) || 0;
+    const duration = displayedAudioDuration(Number(activeMedia?.duration) || 0, latestCompletedCaptureDuration());
     const speed = activeMedia?.playbackRate || getSavedSpeed();
     const volume = activeMedia ? activeMedia.volume : getSavedVolume();
 
@@ -1552,11 +1552,12 @@ import { playerLayoutMode } from "./player-layout";
       currentLabel.textContent = formattedCur;
     }
 
-    const durationNum = Number.isFinite(activeMedia.duration)
+    const mediaDuration = Number.isFinite(activeMedia.duration)
       ? activeMedia.duration
       : info.seekable
       ? info.end
       : 0;
+    const durationNum = displayedAudioDuration(mediaDuration, latestCompletedCaptureDuration());
 
     const formattedDur = durationNum > 0 ? formatTime(durationNum) : "--:--";
     if (durationLabel && cache.durationStr !== formattedDur) {
@@ -1616,6 +1617,11 @@ import { playerLayoutMode } from "./player-layout";
         setIcon(volumeButton, "volume-2");
       }
     }
+  }
+
+  function latestCompletedCaptureDuration(): number | null {
+    const latest = captureManager.summaries()[0];
+    return latest?.state === "complete" ? latest.durationSeconds : null;
   }
 
   // ---------------------------------------------------------------------

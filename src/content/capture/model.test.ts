@@ -3,7 +3,7 @@ import { addChunk, captureProgress, contentLength, createCapture, extensionFor, 
 import { CaptureDiagnostics } from "./diagnostics";
 import { ReadAloudSessionManager } from "./session-manager";
 import { inspectAdts } from "./adts";
-import { playerLayoutMode } from "../player-layout";
+import { displayedAudioDuration, playerLayoutMode } from "../player-layout";
 import type { ChunkStore } from "./indexed-chunk-store";
 
 class MemoryChunkStore implements ChunkStore {
@@ -57,6 +57,10 @@ function splitBytes(bytes: Uint8Array, offsets: number[]): Uint8Array[] {
 }
 
 describe("Read Aloud capture model", () => {
+  test("shows the verified full capture duration instead of the short MediaSource window", () => {
+    expect(displayedAudioDuration(205, 3148.885333)).toBeCloseTo(3148.885333, 6);
+  });
+
   test("opens the player above the composer when the side rails do not fit", () => {
     expect(playerLayoutMode({
       forcedCollapsed: false,
