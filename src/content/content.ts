@@ -6,6 +6,7 @@ import { IndexedChunkStore } from "./capture/indexed-chunk-store";
 import { CaptureDiagnostics } from "./capture/diagnostics";
 import { captureProgress, formatBytes, isSynthesisRequest, requestUrl } from "./capture/model";
 import { ReadAloudSessionManager } from "./capture/session-manager";
+import { playerLayoutMode } from "./player-layout";
 
 (function () {
   "use strict";
@@ -995,6 +996,7 @@ import { ReadAloudSessionManager } from "./capture/session-manager";
     floatingToggle.type = "button";
     floatingToggle.title = "ChatGPT Audio Controls";
     floatingToggle.setAttribute("aria-label", "Expand ChatGPT Audio Controls");
+    floatingToggle.setAttribute("aria-expanded", "false");
     floatingToggle.innerHTML = getLucideSvg("chatgpt-audio");
 
     floatingToggle.addEventListener("click", (e) => {
@@ -1269,13 +1271,13 @@ import { ReadAloudSessionManager } from "./capture/session-manager";
 
     const composer = getComposer();
     const hasActiveAudio = activeMedia && !activeMedia.paused && !activeMedia.ended;
-    const shouldStayCollapsed = userForcedCollapsed;
-    const shouldExpand = Boolean(!shouldStayCollapsed && (hasActiveAudio || userForcedExpand));
 
     if (!composer) {
       cache.isCollapsed = true;
       leftRail.classList.add("cgpt-ra-collapsed");
       rightRail.classList.add("cgpt-ra-collapsed");
+      floatingToggle.setAttribute("aria-label", "Expand ChatGPT Audio Controls");
+      floatingToggle.setAttribute("aria-expanded", "false");
       if (cache.floatingHidden) {
         cache.floatingHidden = false;
         floatingToggle.classList.remove("cgpt-ra-hidden");
@@ -1297,32 +1299,22 @@ import { ReadAloudSessionManager } from "./capture/session-manager";
     const maxLeftWidth = 430;
 
     const minRightWidth = 360;
-    const canFit = leftAvailable >= minLeftWidth && rightAvailable >= minRightWidth;
+    const layoutMode = playerLayoutMode({
+      forcedCollapsed: userForcedCollapsed,
+      forcedExpand: userForcedExpand,
+      activeAudio: Boolean(hasActiveAudio),
+      leftAvailable,
+      rightAvailable,
+      minLeftWidth,
+      minRightWidth,
+    });
 
-    if (shouldStayCollapsed) {
+    if (layoutMode === "collapsed") {
       cache.isCollapsed = true;
       leftRail.classList.add("cgpt-ra-collapsed");
       rightRail.classList.add("cgpt-ra-collapsed");
-
-      if (cache.floatingHidden) {
-        cache.floatingHidden = false;
-        floatingToggle.classList.remove("cgpt-ra-hidden");
-      }
-
-      const toggleX = `${Math.round(Math.min(viewportWidth - 52, rect.right + 12))}px`;
-      const toggleY = `${Math.round(rect.top + rect.height / 2 - 21)}px`;
-
-      if (floatingToggle.style.left !== toggleX) floatingToggle.style.left = toggleX;
-      if (floatingToggle.style.top !== toggleY) floatingToggle.style.top = toggleY;
-      floatingToggle.style.right = "";
-      floatingToggle.style.bottom = "";
-      return;
-    }
-
-    if (!canFit || !shouldExpand) {
-      cache.isCollapsed = true;
-      leftRail.classList.add("cgpt-ra-collapsed");
-      rightRail.classList.add("cgpt-ra-collapsed");
+      floatingToggle.setAttribute("aria-label", "Expand ChatGPT Audio Controls");
+      floatingToggle.setAttribute("aria-expanded", "false");
 
       if (cache.floatingHidden) {
         cache.floatingHidden = false;
@@ -1343,23 +1335,36 @@ import { ReadAloudSessionManager } from "./capture/session-manager";
       cache.floatingHidden = true;
       floatingToggle.classList.add("cgpt-ra-hidden");
     }
+    floatingToggle.setAttribute("aria-label", "Collapse ChatGPT Audio Controls");
+    floatingToggle.setAttribute("aria-expanded", "true");
 
     if (cache.isCollapsed) {
       cache.isCollapsed = false;
       leftRail.classList.remove("cgpt-ra-collapsed");
       rightRail.classList.remove("cgpt-ra-collapsed");
     }
-    const computedLeftWidth = `${Math.round(clamp(leftAvailable, minLeftWidth, maxLeftWidth))}px`;
-    const leftX = `${Math.round(rect.left - sideGap - parseFloat(computedLeftWidth))}px`;
-    const leftY = `${Math.round(rect.top + rect.height / 2 - 24)}px`;
-    const rightX = `${Math.round(rect.right + sideGap)}px`;
+    const rightWidth = rightRail.getBoundingClientRect().width || minRightWidth;
+    const fitsTogetherAbove = rect.width >= minLeftWidth + sideGap + rightWidth;
+    const computedLeftWidth = layoutMode === "side"
+      ? `${Math.round(clamp(leftAvailable, minLeftWidth, maxLeftWidth))}px`
+      : `${Math.round(clamp(fitsTogetherAbove ? rect.width - rightWidth - sideGap : rect.width, minLeftWidth, maxLeftWidth))}px`;
+    const leftX = layoutMode === "side"
+      ? `${Math.round(rect.left - sideGap - parseFloat(computedLeftWidth))}px`
+      : `${Math.round(clamp(rect.left, outerMargin, viewportWidth - parseFloat(computedLeftWidth) - outerMargin))}px`;
+    const leftY = layoutMode === "side"
+      ? `${Math.round(rect.top + rect.height / 2 - 24)}px`
+      : `${Math.round(Math.max(outerMargin, rect.top - (fitsTogetherAbove ? 58 : 116)))}px`;
+    const rightX = layoutMode === "side"
+      ? `${Math.round(rect.right + sideGap)}px`
+      : `${Math.round(clamp(fitsTogetherAbove ? rect.right - rightWidth : rect.left, outerMargin, viewportWidth - rightWidth - outerMargin))}px`;
+    const rightY = layoutMode === "side" ? leftY : `${Math.round(Math.max(outerMargin, rect.top - 58))}px`;
 
     if (leftRail.style.width !== computedLeftWidth) leftRail.style.width = computedLeftWidth;
     if (leftRail.style.left !== leftX) leftRail.style.left = leftX;
     if (leftRail.style.top !== leftY) leftRail.style.top = leftY;
 
     if (rightRail.style.left !== rightX) rightRail.style.left = rightX;
-    if (rightRail.style.top !== leftY) rightRail.style.top = leftY;
+    if (rightRail.style.top !== rightY) rightRail.style.top = rightY;
   }
 
   // ---------------------------------------------------------------------

@@ -3,6 +3,7 @@ import { addChunk, captureProgress, contentLength, createCapture, extensionFor, 
 import { CaptureDiagnostics } from "./diagnostics";
 import { ReadAloudSessionManager } from "./session-manager";
 import { inspectAdts } from "./adts";
+import { playerLayoutMode } from "../player-layout";
 import type { ChunkStore } from "./indexed-chunk-store";
 
 class MemoryChunkStore implements ChunkStore {
@@ -56,6 +57,18 @@ function splitBytes(bytes: Uint8Array, offsets: number[]): Uint8Array[] {
 }
 
 describe("Read Aloud capture model", () => {
+  test("opens the player above the composer when the side rails do not fit", () => {
+    expect(playerLayoutMode({
+      forcedCollapsed: false,
+      forcedExpand: true,
+      activeAudio: false,
+      leftAvailable: 478,
+      rightAvailable: 218,
+      minLeftWidth: 240,
+      minRightWidth: 360,
+    })).toBe("above");
+  });
+
   test("recognizes only the current synthesize endpoint", () => {
     expect(isSynthesisRequest("https://chatgpt.com/backend-api/synthesize?x=1")).toBe(true);
     expect(isSynthesisRequest("https://chatgpt.com/backend-api/conversation")).toBe(false);
