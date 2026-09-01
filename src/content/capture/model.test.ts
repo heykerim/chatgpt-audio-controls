@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { addChunk, captureProgress, contentLength, createCapture, extensionFor, isSynthesisRequest, requestUrl, sanitizeFilenameBase } from "./model";
 import { CaptureDiagnostics } from "./diagnostics";
 import { ReadAloudSessionManager } from "./session-manager";
+import { inspectAdts } from "./adts";
 import type { ChunkStore } from "./indexed-chunk-store";
 
 class MemoryChunkStore implements ChunkStore {
@@ -22,6 +23,36 @@ function streamedResponse(chunks: Uint8Array[], headers: HeadersInit = { "conten
       controller.close();
     },
   }), { headers });
+}
+
+function adtsFrame(payloadByte: number, sampleRateIndex = 4, channelCount = 2): Uint8Array {
+  const payloadLength = 5;
+  const frameLength = 7 + payloadLength;
+  return new Uint8Array([
+    0xff,
+    0xf1,
+    (1 << 6) | (sampleRateIndex << 2) | (channelCount >> 2),
+    ((channelCount & 3) << 6) | ((frameLength >> 11) & 3),
+    (frameLength >> 3) & 0xff,
+    ((frameLength & 7) << 5) | 0x1f,
+    0xfc,
+    payloadByte,
+    payloadByte,
+    payloadByte,
+    payloadByte,
+    payloadByte,
+  ]);
+}
+
+function splitBytes(bytes: Uint8Array, offsets: number[]): Uint8Array[] {
+  const chunks: Uint8Array[] = [];
+  let start = 0;
+  for (const end of offsets) {
+    chunks.push(bytes.slice(start, end));
+    start = end;
+  }
+  chunks.push(bytes.slice(start));
+  return chunks.filter((chunk) => chunk.length > 0);
 }
 
 describe("Read Aloud capture model", () => {
@@ -79,7 +110,7 @@ describe("Read Aloud capture model", () => {
     expect(session.parts[0].state).toBe("complete");
   });
 
-  test("does not infer full-session completion from one completed response", async () => {
+  test("does not expose a download until the current runtime completion signal is applied", async () => {
     const manager = new ReadAloudSessionManager(new MemoryChunkStore(), () => 10);
     manager.begin("Long response");
     const response = streamedResponse([new Uint8Array([0xff, 0xf1, 1])]);
@@ -87,6 +118,8 @@ describe("Read Aloud capture model", () => {
     await manager.captureResponse(part.id, response.clone(), () => {});
     expect(manager.summaries()[0].state).toBe("waiting");
     await expect(manager.blobForSession(manager.summaries()[0].id)).rejects.toThrow("complete Read Aloud session");
+    manager.completeCurrentSession();
+    expect(manager.summaries()[0].state).toBe("complete");
   });
 
   test("marks stream errors as interrupted and never complete", async () => {
@@ -103,8 +136,10 @@ describe("Read Aloud capture model", () => {
   test("keeps sequential synthesize responses as separate parts in one session", async () => {
     const manager = new ReadAloudSessionManager(new MemoryChunkStore(), () => 10);
     manager.begin("Two parts");
-    for (const bytes of [[0xff, 0xf1, 1], [0xff, 0xf1, 2]]) {
-      const response = streamedResponse([new Uint8Array(bytes)]);
+    const first = new Uint8Array([...adtsFrame(1), ...adtsFrame(2)]);
+    const second = new Uint8Array([...adtsFrame(3), ...adtsFrame(4), ...adtsFrame(5)]);
+    for (const chunks of [splitBytes(first, [3, 17]), splitBytes(second, [1, 8, 25])]) {
+      const response = streamedResponse(chunks);
       const part = manager.beginPart({ title: "Two parts", requestUrl: "https://chatgpt.com/backend-api/synthesize", response });
       await manager.captureResponse(part.id, response.clone(), () => {});
     }
@@ -112,7 +147,25 @@ describe("Read Aloud capture model", () => {
     const session = manager.summaries()[0];
     expect(session.parts).toHaveLength(2);
     expect(session.state).toBe("complete");
-    expect((await manager.blobForSession(session.id)).size).toBe(6);
+    expect(session.canDownload).toBe(true);
+    expect(session.durationSeconds).toBeCloseTo((5 * 1024) / 44100, 8);
+    expect((await manager.blobForSession(session.id)).size).toBe(first.length + second.length);
+  });
+
+  test("validates every ADTS frame across arbitrary network chunk boundaries", () => {
+    const audio = new Uint8Array([...adtsFrame(1), ...adtsFrame(2), ...adtsFrame(3)]);
+    const inspected = inspectAdts(splitBytes(audio, [1, 6, 9, 19, 31]));
+    expect(inspected.valid).toBe(true);
+    expect(inspected.frameCount).toBe(3);
+    expect(inspected.sampleRate).toBe(44100);
+    expect(inspected.channelCount).toBe(2);
+    expect(inspected.durationSeconds).toBeCloseTo((3 * 1024) / 44100, 8);
+  });
+
+  test("rejects truncated or incompatible ADTS responses", () => {
+    const valid = adtsFrame(1);
+    expect(inspectAdts([valid.slice(0, valid.length - 1)]).valid).toBe(false);
+    expect(inspectAdts([new Uint8Array([...adtsFrame(1), ...adtsFrame(2, 3)])]).valid).toBe(false);
   });
 
   test("rejects unproven multi-container joining", async () => {

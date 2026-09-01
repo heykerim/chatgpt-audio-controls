@@ -560,20 +560,6 @@ import { ReadAloudSessionManager } from "./capture/session-manager";
     updateCaptureUI();
   }
 
-  /**
-   * A normal MediaSource sourceended event means ChatGPT has finished appending
-   * media bytes. It is deliberately distinct from HTMLAudioElement.ended,
-   * which only describes playback position. Network and decode end states can
-   * also raise sourceended, so they explicitly leave the session interrupted.
-   */
-  function completeSessionWhenMediaHasEnded(): void {
-    const session = captureManager.currentSession();
-    if (!session || session.state !== "waiting") return;
-    if (![...mediaSourceTerminalState.values()].some((state) => state === "normal")) return;
-    if ([...mediaSourceTerminalState.values()].some((state) => state === "error")) return;
-    captureManager.completeCurrentSession();
-  }
-
   function installObjectURLInterceptor(): void {
     try {
       const urlObj = PAGE.URL;
@@ -629,7 +615,6 @@ import { ReadAloudSessionManager } from "./capture/session-manager";
       source.addEventListener(eventName, () => {
         if (eventName === "sourceended" && !mediaSourceTerminalState.has(id)) {
           mediaSourceTerminalState.set(id, "normal");
-          completeSessionWhenMediaHasEnded();
         }
         recordCaptureDiagnostic(`media-source-${eventName}`, { id, readyState: source.readyState });
         publishCaptureState();
@@ -735,7 +720,17 @@ import { ReadAloudSessionManager } from "./capture/session-manager";
                   bytes: updated.receivedBytes,
                   contentType: updated.contentType || null,
                   contentLength: updated.contentLength,
+                  formatVerified: updated.formatVerified,
+                  audioDuration: updated.mediaDurationSeconds,
+                  codecSignature: updated.codecSignature,
+                  formatError: updated.formatError,
                 });
+                // Current ChatGPT performs one synthesize GET for one Read Aloud
+                // action. Its client turns that response body into the final Blob
+                // and has no continuation request. Clone EOF is therefore the
+                // earliest trustworthy full-capture signal and does not depend on
+                // playback reaching the end of the MediaSource.
+                captureManager.completeCurrentSession();
               } else if (updated?.state === "interrupted") {
                 recordCaptureDiagnostic("synthesize-response-interrupted", {
                   partId: updated.id,
@@ -743,7 +738,6 @@ import { ReadAloudSessionManager } from "./capture/session-manager";
                   error: updated.error,
                 });
               }
-              completeSessionWhenMediaHasEnded();
               publishCaptureState();
             });
           }
@@ -755,7 +749,7 @@ import { ReadAloudSessionManager } from "./capture/session-manager";
       wrappedFetch.__cgptRAFetchHook = true;
       PAGE.fetch = wrappedFetch;
 
-      debugCapture("main-world synthesize interception installed");
+      debugCapture("main-world synthesize interception installed [response-eof-v1]");
     } catch (error) {
       warn("fetch interception failed:", error);
     }
@@ -1625,7 +1619,9 @@ import { ReadAloudSessionManager } from "./capture/session-manager";
 
   function updateCaptureUI(): void {
     if (!captureStatus || !downloadButton) return;
-    const session = captureManager.currentSession() || captureManager.summaries().find((item) => item.state === "complete");
+    const currentSessionId = captureManager.currentSession()?.id;
+    const summaries = captureManager.summaries();
+    const session = summaries.find((item) => item.id === currentSessionId) || summaries.find((item) => item.state === "complete");
     if (!session) {
       captureStatus.textContent = "No Read Aloud audio yet";
       downloadButton.disabled = true;
@@ -1658,14 +1654,14 @@ import { ReadAloudSessionManager } from "./capture/session-manager";
     }
 
     const bytes = session.parts.reduce((total, part) => total + part.receivedBytes, 0);
-    const canDownload = session.parts.length === 1 || session.parts.every((part) => part.extension === "aac");
-    if (!canDownload) {
+    if (!session.canDownload) {
       captureStatus.textContent = `Full audio captured • ${formatBytes(bytes)} • parts need remuxing before download`;
       downloadButton.disabled = true;
       downloadButton.title = "The captured parts use a container that cannot be joined safely yet";
       return;
     }
-    captureStatus.textContent = `Full audio captured • ${formatBytes(bytes)}${session.parts.length > 1 ? ` • ${session.parts.length} parts` : ""}`;
+    const duration = session.durationSeconds === null ? "" : `${formatTime(session.durationSeconds)} • `;
+    captureStatus.textContent = `Full audio captured • ${duration}${formatBytes(bytes)}${session.parts.length > 1 ? ` • ${session.parts.length} parts` : ""}`;
     downloadButton.disabled = false;
     downloadButton.title = "Download full audio";
   }

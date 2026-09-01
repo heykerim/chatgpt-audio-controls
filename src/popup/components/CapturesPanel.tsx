@@ -8,6 +8,7 @@ type CaptureSession = {
   receivedBytes: number;
   partCount: number;
   canDownload: boolean;
+  durationSeconds: number | null;
   parts: CapturePart[];
 };
 
@@ -15,6 +16,17 @@ function formatBytes(bytes: number): string {
   if (!bytes) return "0 B";
   const mb = bytes / (1024 * 1024);
   return mb >= 1 ? `${mb.toFixed(mb >= 100 ? 0 : 1)} MB` : `${Math.round(bytes / 1024)} KB`;
+}
+
+function formatDuration(seconds: number | null): string {
+  if (seconds === null || !Number.isFinite(seconds)) return "";
+  const total = Math.floor(seconds);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const remainingSeconds = total % 60;
+  return hours
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`
+    : `${minutes}:${String(remainingSeconds).padStart(2, "0")}`;
 }
 
 function status(session: CaptureSession): string {
@@ -61,7 +73,7 @@ export const CapturesPanel: React.FC = () => {
         <div className="capture-item" key={session.id}>
           <div className="capture-copy">
             <strong>{session.title}</strong>
-            <span>{formatBytes(session.receivedBytes)}{session.partCount > 1 ? ` • ${session.partCount} parts` : ""} • {status(session)}</span>
+            <span>{formatDuration(session.durationSeconds) ? `${formatDuration(session.durationSeconds)} • ` : ""}{formatBytes(session.receivedBytes)}{session.partCount > 1 ? ` • ${session.partCount} parts` : ""} • {status(session)}</span>
           </div>
           <button disabled={session.state !== "complete" || !session.canDownload} onClick={() => download(session.id)}>
             Download

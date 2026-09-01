@@ -7,6 +7,7 @@ import {
   type CaptureSnapshot,
 } from "./model";
 import type { ChunkStore } from "./indexed-chunk-store";
+import { inspectAdts } from "./adts";
 
 export type SessionState = "receiving" | "waiting" | "complete" | "interrupted";
 
@@ -28,6 +29,7 @@ export interface SessionSummary {
   startedAt: number;
   finishedAt: number | null;
   canDownload: boolean;
+  durationSeconds: number | null;
   parts: CaptureSnapshot[];
 }
 
@@ -97,7 +99,14 @@ export class ReadAloudSessionManager {
         onChange();
       }
       const latest = this.partFor(session, partId);
-      this.replacePart(session, completeCapture(latest, this.now()));
+      const inspection = inspectAdts(await this.store.getAll(partId));
+      this.replacePart(session, {
+        ...completeCapture(latest, this.now()),
+        formatVerified: inspection.valid,
+        formatError: inspection.error,
+        mediaDurationSeconds: inspection.durationSeconds,
+        codecSignature: inspection.signature,
+      });
       session.state = "waiting";
       onChange();
     } catch (error) {
@@ -140,17 +149,23 @@ export class ReadAloudSessionManager {
   summaries(): SessionSummary[] {
     return [...this.sessions.values()]
       .sort((a, b) => b.startedAt - a.startedAt)
-      .map((session) => ({
-        id: session.id,
-        title: session.title,
-        state: session.state,
-        partCount: session.parts.length,
-        receivedBytes: session.parts.reduce((total, part) => total + part.receivedBytes, 0),
-        startedAt: session.startedAt,
-        finishedAt: session.finishedAt,
-        canDownload: session.parts.length === 1 || session.parts.every((part) => part.extension === "aac"),
-        parts: session.parts.map((part) => ({ ...part })),
-      }));
+      .map((session) => {
+        const compatibility = compatibleParts(session.parts);
+        return {
+          id: session.id,
+          title: session.title,
+          state: session.state,
+          partCount: session.parts.length,
+          receivedBytes: session.parts.reduce((total, part) => total + part.receivedBytes, 0),
+          startedAt: session.startedAt,
+          finishedAt: session.finishedAt,
+          canDownload:
+            session.state === "complete" &&
+            (session.parts.length === 1 ? session.parts[0].receivedBytes > 0 : compatibility.compatible),
+          durationSeconds: compatibility.durationSeconds,
+          parts: session.parts.map((part) => ({ ...part })),
+        };
+      });
   }
 
   async blobForSession(sessionId: string): Promise<Blob> {
@@ -159,8 +174,12 @@ export class ReadAloudSessionManager {
       throw new Error("A complete Read Aloud session is not available.");
     }
     const partChunks = await Promise.all(session.parts.map((part) => this.store.getAll(part.id)));
-    if (session.parts.length > 1 && !partChunks.every((chunks) => isAdtsAac(chunks[0]))) {
-      throw new Error("This session has multiple containerized parts. They need remuxing before one complete download is safe.");
+    if (session.parts.length > 1) {
+      const inspections = partChunks.map(inspectAdts);
+      const signatures = new Set(inspections.map((inspection) => inspection.signature));
+      if (inspections.some((inspection) => !inspection.valid) || signatures.size !== 1) {
+        throw new Error("This session has incompatible or containerized parts. They need remuxing before one complete download is safe.");
+      }
     }
     const blobParts = partChunks.flat().map((chunk) =>
       chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength) as ArrayBuffer,
@@ -185,6 +204,14 @@ export class ReadAloudSessionManager {
   }
 }
 
-function isAdtsAac(chunk: Uint8Array | undefined): boolean {
-  return Boolean(chunk && chunk.length >= 2 && chunk[0] === 0xff && (chunk[1] & 0xf6) === 0xf0);
+function compatibleParts(parts: CaptureSnapshot[]): { compatible: boolean; durationSeconds: number | null } {
+  if (!parts.length || parts.some((part) => !part.formatVerified || !part.codecSignature || part.mediaDurationSeconds === null)) {
+    return { compatible: false, durationSeconds: null };
+  }
+  const signatures = new Set(parts.map((part) => part.codecSignature));
+  if (signatures.size !== 1) return { compatible: false, durationSeconds: null };
+  return {
+    compatible: true,
+    durationSeconds: parts.reduce((total, part) => total + (part.mediaDurationSeconds || 0), 0),
+  };
 }

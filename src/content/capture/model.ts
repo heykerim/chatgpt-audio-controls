@@ -13,6 +13,10 @@ export interface CaptureSnapshot {
   contentLength: number | null;
   contentType: string;
   extension: string;
+  formatVerified: boolean;
+  formatError: string | null;
+  mediaDurationSeconds: number | null;
+  codecSignature: string | null;
   error: string | null;
 }
 
@@ -107,6 +111,10 @@ export function createCapture(input: {
     state: "receiving",
     receivedBytes: 0,
     extension: extensionFor(input.contentType),
+    formatVerified: false,
+    formatError: null,
+    mediaDurationSeconds: null,
+    codecSignature: null,
     error: null,
   };
 }
