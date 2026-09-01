@@ -5,7 +5,7 @@ import { getTranslations } from "../shared/i18n";
 import { IndexedChunkStore } from "./capture/indexed-chunk-store";
 import { CaptureDiagnostics } from "./capture/diagnostics";
 import { captureProgress, formatBytes, isSynthesisRequest, requestUrl } from "./capture/model";
-import { ReadAloudSessionManager } from "./capture/session-manager";
+import { OBSERVED_SYNTHESIS_TEXT_LIMIT, ReadAloudSessionManager } from "./capture/session-manager";
 import { displayedAudioDuration, playerLayoutMode } from "./player-layout";
 
 (function () {
@@ -502,13 +502,29 @@ import { displayedAudioDuration, playerLayoutMode } from "./player-layout";
     return title || "chatgpt";
   }
 
-  function beginUserReadAloudSession(): void {
+  function readAloudSourceText(control: Element | null): string {
+    const inlineSource = pendingInlineButton?.closest("article, [data-testid^='conversation-turn']") || null;
+    const nativeSource = control?.closest("article, [data-testid^='conversation-turn']") || null;
+    const turn = inlineSource || nativeSource;
+    const message = turn?.querySelector('[data-message-author-role="assistant"]') ||
+      (turn?.matches('[data-message-author-role="assistant"]') ? turn : null);
+    const body = message?.querySelector(".markdown") || message;
+    return body?.textContent?.trim() || "";
+  }
+
+  function beginUserReadAloudSession(control: Element | null = null): void {
     const current = captureManager.currentSession();
     if (current?.state === "receiving") return;
-    const session = captureManager.begin(currentCaptureTitle());
+    const sourceText = readAloudSourceText(control);
+    const session = captureManager.begin(currentCaptureTitle(), sourceText ? sourceText.length : null);
     mediaSourceTerminalState.clear();
     captureDiagnostics.clear();
-    recordCaptureDiagnostic("session-start", { sessionId: session.id, title: session.title });
+    recordCaptureDiagnostic("session-start", {
+      sessionId: session.id,
+      title: session.title,
+      sourceCharacterCount: session.sourceCharacterCount,
+      observedSynthesisTextLimit: OBSERVED_SYNTHESIS_TEXT_LIMIT,
+    });
     publishCaptureState();
   }
 
@@ -1621,7 +1637,7 @@ import { displayedAudioDuration, playerLayoutMode } from "./player-layout";
 
   function latestCompletedCaptureDuration(): number | null {
     const latest = captureManager.summaries()[0];
-    return latest?.state === "complete" ? latest.durationSeconds : null;
+    return latest?.state === "complete" || latest?.state === "partial" ? latest.durationSeconds : null;
   }
 
   // ---------------------------------------------------------------------
@@ -1632,7 +1648,8 @@ import { displayedAudioDuration, playerLayoutMode } from "./player-layout";
     if (!captureStatus || !downloadButton) return;
     const currentSessionId = captureManager.currentSession()?.id;
     const summaries = captureManager.summaries();
-    const session = summaries.find((item) => item.id === currentSessionId) || summaries.find((item) => item.state === "complete");
+    const session = summaries.find((item) => item.id === currentSessionId) ||
+      summaries.find((item) => item.state === "complete" || item.state === "partial");
     if (!session) {
       captureStatus.textContent = "No Read Aloud audio yet";
       downloadButton.disabled = true;
@@ -1665,13 +1682,20 @@ import { displayedAudioDuration, playerLayoutMode } from "./player-layout";
     }
 
     const bytes = session.parts.reduce((total, part) => total + part.receivedBytes, 0);
+    const duration = session.durationSeconds === null ? "" : `${formatTime(session.durationSeconds)} • `;
+    if (session.state === "partial") {
+      const sourceSize = session.sourceCharacterCount === null ? "" : ` of ${session.sourceCharacterCount.toLocaleString()} source characters`;
+      captureStatus.textContent = `Partial audio captured • ${duration}${formatBytes(bytes)} • ChatGPT stopped near ${OBSERVED_SYNTHESIS_TEXT_LIMIT.toLocaleString()}${sourceSize}`;
+      downloadButton.disabled = !session.canDownload;
+      downloadButton.title = session.canDownload ? "Download captured part" : "The captured audio is not downloadable";
+      return;
+    }
     if (!session.canDownload) {
       captureStatus.textContent = `Full audio captured • ${formatBytes(bytes)} • parts need remuxing before download`;
       downloadButton.disabled = true;
       downloadButton.title = "The captured parts use a container that cannot be joined safely yet";
       return;
     }
-    const duration = session.durationSeconds === null ? "" : `${formatTime(session.durationSeconds)} • `;
     captureStatus.textContent = `Full audio captured • ${duration}${formatBytes(bytes)}${session.parts.length > 1 ? ` • ${session.parts.length} parts` : ""}`;
     downloadButton.disabled = false;
     downloadButton.title = "Download full audio";
@@ -1680,7 +1704,7 @@ import { displayedAudioDuration, playerLayoutMode } from "./player-layout";
   async function downloadCurrentAudio(requestedSessionId?: string): Promise<void> {
     if (!downloadButton) return;
     const session = captureManager.summaries().find((item) => item.id === requestedSessionId) ||
-      captureManager.summaries().find((item) => item.state === "complete");
+      captureManager.summaries().find((item) => item.state === "complete" || item.state === "partial");
     if (!session) return;
 
     downloadButton.setAttribute("disabled", "true");
@@ -2269,7 +2293,7 @@ import { displayedAudioDuration, playerLayoutMode } from "./player-layout";
       (event) => {
         const target = event.target instanceof Element ? event.target.closest("button, [role='menuitem'], [role='option']") : null;
         if (target && !target.classList.contains("cgpt-inline-readaloud") && isReadAloudControl(target)) {
-          beginUserReadAloudSession();
+          beginUserReadAloudSession(target);
         }
       },
       true,

@@ -134,9 +134,24 @@ describe("Read Aloud capture model", () => {
     const part = manager.beginPart({ title: "Long response", requestUrl: "https://chatgpt.com/backend-api/synthesize", response });
     await manager.captureResponse(part.id, response.clone(), () => {});
     expect(manager.summaries()[0].state).toBe("waiting");
-    await expect(manager.blobForSession(manager.summaries()[0].id)).rejects.toThrow("complete Read Aloud session");
+    await expect(manager.blobForSession(manager.summaries()[0].id)).rejects.toThrow("downloadable Read Aloud capture");
     manager.completeCurrentSession();
     expect(manager.summaries()[0].state).toBe("complete");
+  });
+
+  test("marks a finished synthesis response as partial when the source exceeds the observed ChatGPT limit", async () => {
+    const manager = new ReadAloudSessionManager(new MemoryChunkStore(), () => 10);
+    manager.begin("Long response", 99_773);
+    const audio = new Uint8Array([...adtsFrame(1), ...adtsFrame(2)]);
+    const response = streamedResponse([audio]);
+    const part = manager.beginPart({ title: "Long response", requestUrl: "https://chatgpt.com/backend-api/synthesize", response });
+    await manager.captureResponse(part.id, response.clone(), () => {});
+    manager.completeCurrentSession();
+    const [session] = manager.summaries();
+    expect(session.state).toBe("partial");
+    expect(session.sourceLimitExceeded).toBe(true);
+    expect(session.canDownload).toBe(true);
+    expect((await manager.blobForSession(session.id)).size).toBe(audio.length);
   });
 
   test("marks stream errors as interrupted and never complete", async () => {

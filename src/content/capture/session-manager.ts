@@ -9,7 +9,9 @@ import {
 import type { ChunkStore } from "./indexed-chunk-store";
 import { inspectAdts } from "./adts";
 
-export type SessionState = "receiving" | "waiting" | "complete" | "interrupted";
+export type SessionState = "receiving" | "waiting" | "complete" | "partial" | "interrupted";
+
+export const OBSERVED_SYNTHESIS_TEXT_LIMIT = 50_000;
 
 export interface ReadAloudSession {
   id: string;
@@ -17,6 +19,7 @@ export interface ReadAloudSession {
   startedAt: number;
   finishedAt: number | null;
   state: SessionState;
+  sourceCharacterCount: number | null;
   parts: CaptureSnapshot[];
 }
 
@@ -30,6 +33,8 @@ export interface SessionSummary {
   finishedAt: number | null;
   canDownload: boolean;
   durationSeconds: number | null;
+  sourceCharacterCount: number | null;
+  sourceLimitExceeded: boolean;
   parts: CaptureSnapshot[];
 }
 
@@ -40,13 +45,14 @@ export class ReadAloudSessionManager {
 
   constructor(private readonly store: ChunkStore, private readonly now: () => number = Date.now) {}
 
-  begin(title: string): ReadAloudSession {
+  begin(title: string, sourceCharacterCount: number | null = null): ReadAloudSession {
     const session: ReadAloudSession = {
       id: `session-${this.now()}-${crypto.getRandomValues(new Uint32Array(1))[0].toString(36)}`,
       title,
       startedAt: this.now(),
       finishedAt: null,
       state: "receiving",
+      sourceCharacterCount,
       parts: [],
     };
     this.sessions.set(session.id, session);
@@ -56,7 +62,7 @@ export class ReadAloudSessionManager {
 
   beginPart(input: { title: string; requestUrl: string; response: Response }): CaptureSnapshot {
     let session = this.currentSessionId ? this.sessions.get(this.currentSessionId) : undefined;
-    if (!session || session.state === "complete" || session.state === "interrupted") {
+    if (!session || session.state === "complete" || session.state === "partial" || session.state === "interrupted") {
       session = this.begin(input.title);
     }
 
@@ -127,7 +133,9 @@ export class ReadAloudSessionManager {
   completeCurrentSession(): void {
     const session = this.currentSession();
     if (!session || session.state === "receiving" || session.parts.some((part) => part.state !== "complete")) return;
-    session.state = "complete";
+    session.state = session.sourceCharacterCount !== null && session.sourceCharacterCount > OBSERVED_SYNTHESIS_TEXT_LIMIT
+      ? "partial"
+      : "complete";
     session.finishedAt = this.now();
     this.currentSessionId = null;
   }
@@ -160,9 +168,12 @@ export class ReadAloudSessionManager {
           startedAt: session.startedAt,
           finishedAt: session.finishedAt,
           canDownload:
-            session.state === "complete" &&
+            (session.state === "complete" || session.state === "partial") &&
             (session.parts.length === 1 ? session.parts[0].receivedBytes > 0 : compatibility.compatible),
           durationSeconds: compatibility.durationSeconds,
+          sourceCharacterCount: session.sourceCharacterCount,
+          sourceLimitExceeded:
+            session.sourceCharacterCount !== null && session.sourceCharacterCount > OBSERVED_SYNTHESIS_TEXT_LIMIT,
           parts: session.parts.map((part) => ({ ...part })),
         };
       });
@@ -170,8 +181,8 @@ export class ReadAloudSessionManager {
 
   async blobForSession(sessionId: string): Promise<Blob> {
     const session = this.sessions.get(sessionId);
-    if (!session || session.state !== "complete" || !session.parts.length) {
-      throw new Error("A complete Read Aloud session is not available.");
+    if (!session || (session.state !== "complete" && session.state !== "partial") || !session.parts.length) {
+      throw new Error("A downloadable Read Aloud capture is not available.");
     }
     const partChunks = await Promise.all(session.parts.map((part) => this.store.getAll(part.id)));
     if (session.parts.length > 1) {
