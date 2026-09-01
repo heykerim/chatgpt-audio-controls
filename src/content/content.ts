@@ -2,6 +2,10 @@ import { getLucideSvg, setIcon } from "./icons";
 import { SPEED_PRESETS, STORAGE_KEYS } from "../shared/constants";
 import { ExtensionSettings } from "../shared/types";
 import { getTranslations } from "../shared/i18n";
+import { IndexedChunkStore } from "./capture/indexed-chunk-store";
+import { CaptureDiagnostics } from "./capture/diagnostics";
+import { captureProgress, formatBytes, isSynthesisRequest, requestUrl } from "./capture/model";
+import { ReadAloudSessionManager } from "./capture/session-manager";
 
 (function () {
   "use strict";
@@ -45,14 +49,17 @@ import { getTranslations } from "../shared/i18n";
   let volumeWrap: HTMLElement | null = null;
   let volumeSlider: HTMLInputElement | null = null;
   let volumeLabel: HTMLElement | null = null;
-  let downloadButton: HTMLElement | null = null;
+  let downloadButton: HTMLButtonElement | null = null;
+  let captureStatus: HTMLElement | null = null;
 
   let sliderDragging = false;
-
-  let capturedAudioBlob: Blob | null = null;
-  let capturedAudioMime = "";
-  let capturedAudioURL = "";
-  let capturedAudioAt = 0;
+  const captureManager = new ReadAloudSessionManager(new IndexedChunkStore());
+  const captureDiagnostics = new CaptureDiagnostics();
+  const lastLoggedCaptureBytes = new Map<string, number>();
+  const mediaSourceIds = new WeakMap<object, string>();
+  const sourceBufferMediaSourceIds = new WeakMap<object, string>();
+  let mediaSourceSequence = 0;
+  const lastMediaTelemetryAt = new WeakMap<HTMLMediaElement, number>();
 
   // Keep only a small byte-bounded cache. A Blob is a strong reference to the
   // complete audio payload, so an entry-count cap alone can retain too much.
@@ -256,6 +263,49 @@ import { getTranslations } from "../shared/i18n";
   function installSettingsBridge(): void {
     window.addEventListener("message", (event: MessageEvent) => {
       if (
+        event.source === window &&
+        event.data?.source === "chatgpt-audio-controls-capture" &&
+        event.data?.type === "CGPT_RA_CAPTURE_LIST_REQUEST"
+      ) {
+        window.postMessage(
+          {
+            source: "chatgpt-audio-controls-capture",
+            type: "CGPT_RA_CAPTURE_LIST_RESPONSE",
+            requestId: event.data.requestId,
+            sessions: captureManager.summaries(),
+          },
+          "*",
+        );
+        return;
+      }
+
+      if (
+        event.source === window &&
+        event.data?.source === "chatgpt-audio-controls-capture" &&
+        event.data?.type === "CGPT_RA_CAPTURE_DIAGNOSTICS_REQUEST"
+      ) {
+        window.postMessage(
+          {
+            source: "chatgpt-audio-controls-capture",
+            type: "CGPT_RA_CAPTURE_DIAGNOSTICS_RESPONSE",
+            requestId: event.data.requestId,
+            events: captureDiagnostics.snapshot(),
+          },
+          "*",
+        );
+        return;
+      }
+
+      if (
+        event.source === window &&
+        event.data?.source === "chatgpt-audio-controls-capture" &&
+        event.data?.type === "CGPT_RA_CAPTURE_DOWNLOAD_REQUEST"
+      ) {
+        void downloadCurrentAudio(event.data.sessionId);
+        return;
+      }
+
+      if (
         event.source !== window ||
         event.data?.source !== "chatgpt-audio-controls-settings-bridge" ||
         event.data?.type !== "CGPT_RA_SETTINGS_UPDATE"
@@ -445,22 +495,67 @@ import { getTranslations } from "../shared/i18n";
     );
   }
 
-  function rememberAudioBlob(blob: Blob, sourceURL = ""): void {
-    if (!(blob instanceof Blob) || !blob.size) return;
+  function currentCaptureTitle(): string {
+    const title = document.title.replace(/\s*[-|]\s*chatgpt\s*$/i, "").trim();
+    return title || "chatgpt";
+  }
 
-    const mime = blob.type || "";
-    if (mime && !looksLikeAudio(sourceURL, mime)) return;
+  function beginUserReadAloudSession(): void {
+    const current = captureManager.currentSession();
+    if (current?.state === "receiving") return;
+    const session = captureManager.begin(currentCaptureTitle());
+    captureDiagnostics.clear();
+    recordCaptureDiagnostic("session-start", { sessionId: session.id, title: session.title });
+    publishCaptureState();
+  }
 
-    capturedAudioBlob = blob;
-    capturedAudioMime = mime;
-    capturedAudioURL = sourceURL;
-    capturedAudioAt = Date.now();
+  function debugCapture(...args: any[]): void {
+    if (captureDebugEnabled()) {
+      console.log("[ReadAloudCapture]", ...args);
+    }
+  }
 
-    log("Captured audio payload", {
-      size: blob.size,
-      type: blob.type,
-      sourceURL,
-    });
+  function captureDebugEnabled(): boolean {
+    return CONFIG.debug || localStorage.getItem("cgpt-ra-capture-debug") === "1";
+  }
+
+  function recordCaptureDiagnostic(type: string, data: Record<string, unknown> = {}): void {
+    if (captureDebugEnabled()) captureDiagnostics.record(type, data);
+  }
+
+  function publishCaptureState(): void {
+    const sessions = captureManager.summaries();
+    window.postMessage(
+      {
+        source: "chatgpt-audio-controls-capture",
+        type: "CGPT_RA_CAPTURE_UPDATE",
+        sessions,
+      },
+      "*",
+    );
+
+    if (captureDebugEnabled()) {
+      window.postMessage(
+        {
+          source: "chatgpt-audio-controls-capture",
+          type: "CGPT_RA_CAPTURE_DIAGNOSTICS_UPDATE",
+          events: captureDiagnostics.snapshot(),
+        },
+        "*",
+      );
+    }
+
+    const current = captureManager.currentSession();
+    if (current) {
+      for (const part of current.parts) {
+        const previous = lastLoggedCaptureBytes.get(part.id) || 0;
+        if (part.receivedBytes === 0 || part.receivedBytes - previous >= 512 * 1024 || part.state !== "receiving") {
+          lastLoggedCaptureBytes.set(part.id, part.receivedBytes);
+          debugCapture(`part ${part.id}`, captureProgress(part), part.state);
+        }
+      }
+    }
+    updateCaptureUI();
   }
 
   function installObjectURLInterceptor(): void {
@@ -475,9 +570,11 @@ import { getTranslations } from "../shared/i18n";
         const url = originalCreate(object);
 
         try {
+          if (PAGE.MediaSource && object instanceof PAGE.MediaSource) {
+            instrumentMediaSource(object);
+          }
           if (object instanceof PAGE.Blob && object.size && looksLikeAudio(url, object.type)) {
             rememberBlobURL(url, object);
-            rememberAudioBlob(object, url);
           }
         } catch (_) {}
 
@@ -498,29 +595,130 @@ import { getTranslations } from "../shared/i18n";
     }
   }
 
+  function mediaSourceId(source: object): string {
+    let id = mediaSourceIds.get(source);
+    if (!id) {
+      mediaSourceSequence += 1;
+      id = `media-source-${mediaSourceSequence}`;
+      mediaSourceIds.set(source, id);
+    }
+    return id;
+  }
+
+  function instrumentMediaSource(source: MediaSource): void {
+    const id = mediaSourceId(source);
+    recordCaptureDiagnostic("media-source-observed", { id, readyState: source.readyState });
+    debugCapture(`${id} observed`, { readyState: source.readyState });
+    ["sourceopen", "sourceended", "sourceclose"].forEach((eventName) => {
+      source.addEventListener(eventName, () => {
+        recordCaptureDiagnostic(`media-source-${eventName}`, { id, readyState: source.readyState });
+        publishCaptureState();
+        debugCapture(`${id} ${eventName}`, { readyState: source.readyState });
+      });
+    });
+  }
+
+  function installMediaSourceInstrumentation(): void {
+    try {
+      const sourceProto = PAGE.MediaSource?.prototype;
+      if (sourceProto && !sourceProto.__cgptRAMediaSourceHook) {
+        const originalAddSourceBuffer = sourceProto.addSourceBuffer;
+        const originalEndOfStream = sourceProto.endOfStream;
+        sourceProto.addSourceBuffer = function (this: MediaSource, mime: string) {
+          instrumentMediaSource(this);
+          const buffer = Reflect.apply(originalAddSourceBuffer, this, [mime]) as SourceBuffer;
+          const id = mediaSourceId(this);
+          sourceBufferMediaSourceIds.set(buffer, id);
+          recordCaptureDiagnostic("source-buffer-created", { mediaSourceId: id, mime });
+          publishCaptureState();
+          debugCapture(`${id} addSourceBuffer`, mime);
+          return buffer;
+        };
+        sourceProto.endOfStream = function (this: MediaSource, ...args: any[]) {
+          recordCaptureDiagnostic("media-source-end-of-stream", {
+            id: mediaSourceId(this),
+            error: typeof args[0] === "string" ? args[0] : null,
+          });
+          publishCaptureState();
+          debugCapture(`${mediaSourceId(this)} endOfStream`, args[0] || "ok");
+          return Reflect.apply(originalEndOfStream, this, args);
+        };
+        Object.defineProperty(sourceProto, "__cgptRAMediaSourceHook", { value: true, configurable: true });
+      }
+
+      const bufferProto = PAGE.SourceBuffer?.prototype;
+      if (bufferProto && !bufferProto.__cgptRASourceBufferHook) {
+        const originalAppend = bufferProto.appendBuffer;
+        bufferProto.appendBuffer = function (this: SourceBuffer, data: BufferSource) {
+          const bytes = data instanceof ArrayBuffer ? data.byteLength : data.byteLength;
+          const sourceId = sourceBufferMediaSourceIds.get(this) || "unmapped-source-buffer";
+          recordCaptureDiagnostic("source-buffer-append", { mediaSourceId: sourceId, bytes });
+          publishCaptureState();
+          debugCapture(`${sourceId} appendBuffer`, { bytes, buffered: this.buffered.length });
+          return Reflect.apply(originalAppend, this, [data]);
+        };
+        Object.defineProperty(bufferProto, "__cgptRASourceBufferHook", { value: true, configurable: true });
+      }
+    } catch (error) {
+      warn("MediaSource instrumentation failed:", error);
+    }
+  }
+
   function installFetchInterceptor(): void {
     try {
       if (!PAGE.fetch || PAGE.fetch.__cgptRAFetchHook) return;
 
-      const originalFetch = PAGE.fetch.bind(PAGE);
+      const originalFetch = PAGE.fetch;
 
-      async function wrappedFetch(...args: any[]) {
-        const response = await originalFetch(...args);
+      async function wrappedFetch(this: any, ...args: any[]) {
+        const startedAt = Date.now();
+        const requestedURL = requestUrl(args[0]);
+        if (isSynthesisRequest(requestedURL)) {
+          recordCaptureDiagnostic("synthesize-request-start", { url: requestedURL });
+          publishCaptureState();
+        }
+        const response = (await Reflect.apply(originalFetch, this, args)) as Response;
 
         try {
-          const requestURL =
-            typeof args[0] === "string"
-              ? args[0]
-              : args[0]?.url || response.url || "";
-
-          const type = response.headers?.get("content-type") || "";
-
-          if (looksLikeAudio(requestURL, type)) {
-            response
-              .clone()
-              .blob()
-              .then((blob: Blob) => rememberAudioBlob(blob, requestURL))
-              .catch(() => {});
+          const requestURL = requestUrl(args[0]) || response.url || "";
+          if (isSynthesisRequest(requestURL) && response.ok) {
+            const part = captureManager.beginPart({
+              title: currentCaptureTitle(),
+              requestUrl: requestURL,
+              response,
+            });
+            recordCaptureDiagnostic("synthesize-response-headers", {
+              partId: part.id,
+              url: requestURL,
+              requestStartedAt: startedAt,
+              responseStartedAt: Date.now(),
+              status: response.status,
+              contentType: part.contentType || null,
+              contentLength: part.contentLength,
+            });
+            debugCapture("synthesize request detected", part.id);
+            debugCapture(`response ${response.status}`, part.contentType || "unknown type");
+            publishCaptureState();
+            void captureManager.captureResponse(part.id, response.clone(), () => {
+              const updated = captureManager.currentSession()?.parts.find((candidate) => candidate.id === part.id);
+              if (updated?.state === "complete") {
+                recordCaptureDiagnostic("synthesize-response-complete", {
+                  partId: updated.id,
+                  requestStartedAt: startedAt,
+                  responseEndedAt: updated.completedAt,
+                  bytes: updated.receivedBytes,
+                  contentType: updated.contentType || null,
+                  contentLength: updated.contentLength,
+                });
+              } else if (updated?.state === "interrupted") {
+                recordCaptureDiagnostic("synthesize-response-interrupted", {
+                  partId: updated.id,
+                  bytes: updated.receivedBytes,
+                  error: updated.error,
+                });
+              }
+              publishCaptureState();
+            });
           }
         } catch (_) {}
 
@@ -530,7 +728,7 @@ import { getTranslations } from "../shared/i18n";
       wrappedFetch.__cgptRAFetchHook = true;
       PAGE.fetch = wrappedFetch;
 
-      log("fetch() audio capture installed");
+      debugCapture("main-world synthesize interception installed");
     } catch (error) {
       warn("fetch interception failed:", error);
     }
@@ -559,11 +757,8 @@ import { getTranslations } from "../shared/i18n";
 
               if (!looksLikeAudio(url, type)) return;
 
-              if (this.response instanceof PAGE.Blob) {
-                rememberAudioBlob(this.response, url);
-              } else if (this.response instanceof PAGE.ArrayBuffer) {
-                rememberAudioBlob(new Blob([this.response], { type }), url);
-              }
+              // Current ChatGPT Read Aloud uses fetch. Keep this hook only for
+              // media-player detection; do not treat an arbitrary XHR as a full capture.
             } catch (_) {}
           },
           { once: true },
@@ -621,7 +816,6 @@ import { getTranslations } from "../shared/i18n";
       !media.isConnected ||
       Boolean(pendingInlineButton) ||
       blobURLMap.has(source) ||
-      source === capturedAudioURL ||
       looksLikeAudio(source, "")
     );
   }
@@ -674,6 +868,7 @@ import { getTranslations } from "../shared/i18n";
       "pause",
       "ended",
       "canplay",
+      "progress",
     ].forEach((name) => {
       media.addEventListener(name, () => {
         if (activeMedia === media) {
@@ -683,9 +878,33 @@ import { getTranslations } from "../shared/i18n";
           if (name === "play" || name === "pause" || name === "ended") {
             scheduleLayoutSync();
           }
+          if (name !== "timeupdate") logMediaTelemetry(media, name);
         }
       });
     });
+  }
+
+  function rangesForTelemetry(ranges: TimeRanges): Array<[number, number]> {
+    const values: Array<[number, number]> = [];
+    for (let index = 0; index < ranges.length; index += 1) values.push([ranges.start(index), ranges.end(index)]);
+    return values;
+  }
+
+  function logMediaTelemetry(media: HTMLMediaElement, eventName: string): void {
+    const now = Date.now();
+    const last = lastMediaTelemetryAt.get(media) || 0;
+    if (eventName === "progress" && now - last < 2_000) return;
+    lastMediaTelemetryAt.set(media, now);
+    try {
+      const details = {
+        duration: Number.isFinite(media.duration) ? media.duration : null,
+        buffered: rangesForTelemetry(media.buffered),
+        seekable: rangesForTelemetry(media.seekable),
+      };
+      recordCaptureDiagnostic(`audio-${eventName}`, details);
+      publishCaptureState();
+      debugCapture(`audio ${eventName}`, details);
+    } catch (_) {}
   }
 
   function installMediaInterceptor(): void {
@@ -779,6 +998,7 @@ import { getTranslations } from "../shared/i18n";
                  type="range" min="0" max="100" step="0.01" value="0" disabled>
         </div>
       </div>
+      <div class="cgpt-ra-capture-status" aria-live="polite">No Read Aloud audio yet</div>
     `;
 
     rightRail = document.createElement("div");
@@ -891,7 +1111,8 @@ import { getTranslations } from "../shared/i18n";
     volumeWrap = rightRail.querySelector(".cgpt-ra-volume-wrap");
     volumeSlider = rightRail.querySelector(".cgpt-ra-volume-slider");
     volumeLabel = rightRail.querySelector(".cgpt-ra-volume-value");
-    downloadButton = rightRail.querySelector(".cgpt-ra-download");
+    downloadButton = rightRail.querySelector<HTMLButtonElement>(".cgpt-ra-download");
+    captureStatus = leftRail.querySelector(".cgpt-ra-capture-status");
 
     CONFIG.speeds.forEach((speed) => {
       const item = document.createElement("button");
@@ -959,10 +1180,11 @@ import { getTranslations } from "../shared/i18n";
       { passive: false }
     );
 
-    downloadButton?.addEventListener("click", downloadCurrentAudio);
+    downloadButton?.addEventListener("click", () => void downloadCurrentAudio());
 
     applyI18nLabels();
     setControlsEnabled(Boolean(activeMedia));
+    updateCaptureUI();
     detectAndCacheChatGPTTheme();
     syncComposerLayout();
   }
@@ -1374,78 +1596,68 @@ import { getTranslations } from "../shared/i18n";
   // Download Audio
   // ---------------------------------------------------------------------
 
-  function extensionFor(mime: string, url = ""): string {
-    const type = String(mime || "").toLowerCase();
+  function updateCaptureUI(): void {
+    if (!captureStatus || !downloadButton) return;
+    const session = captureManager.currentSession() || captureManager.summaries().find((item) => item.state === "complete");
+    if (!session) {
+      captureStatus.textContent = "No Read Aloud audio yet";
+      downloadButton.disabled = true;
+      downloadButton.title = "No Read Aloud audio yet";
+      return;
+    }
 
-    if (type.includes("mpeg")) return "mp3";
-    if (type.includes("mp4") || type.includes("m4a") || type.includes("aac"))
-      return "m4a";
-    if (type.includes("wav")) return "wav";
-    if (type.includes("ogg") || type.includes("opus")) return "ogg";
-    if (type.includes("webm")) return "webm";
+    if (session.state === "receiving") {
+      const part = session.parts.at(-1);
+      captureStatus.textContent = part
+        ? `Receiving audio… ${captureProgress(part)} • part ${session.parts.length}`
+        : "Receiving audio…";
+      downloadButton.disabled = true;
+      downloadButton.title = "Full audio is still being captured";
+      return;
+    }
 
-    const match = String(url).match(
-      /\.(mp3|m4a|aac|wav|ogg|opus|webm)(?:$|\?)/i,
-    );
-    return match ? match[1].toLowerCase() : "mp3";
+    if (session.state === "waiting") {
+      captureStatus.textContent = `Audio part captured • ${formatBytes(session.parts.reduce((total, part) => total + part.receivedBytes, 0))} total • waiting for the next part`;
+      downloadButton.disabled = true;
+      downloadButton.title = "Waiting for ChatGPT to finish this Read Aloud session";
+      return;
+    }
+
+    if (session.state === "interrupted") {
+      captureStatus.textContent = `Capture interrupted • ${formatBytes(session.parts.reduce((total, part) => total + part.receivedBytes, 0))} retained as partial data`;
+      downloadButton.disabled = true;
+      downloadButton.title = "A complete audio file is not available";
+      return;
+    }
+
+    const bytes = session.parts.reduce((total, part) => total + part.receivedBytes, 0);
+    const canDownload = session.parts.length === 1 || session.parts.every((part) => part.extension === "aac");
+    if (!canDownload) {
+      captureStatus.textContent = `Full audio captured • ${formatBytes(bytes)} • parts need remuxing before download`;
+      downloadButton.disabled = true;
+      downloadButton.title = "The captured parts use a container that cannot be joined safely yet";
+      return;
+    }
+    captureStatus.textContent = `Full audio captured • ${formatBytes(bytes)}${session.parts.length > 1 ? ` • ${session.parts.length} parts` : ""}`;
+    downloadButton.disabled = false;
+    downloadButton.title = "Download full audio";
   }
 
-  async function resolveDownloadBlob(): Promise<{ blob: Blob; mime: string; url: string }> {
-    if (capturedAudioBlob && Date.now() - capturedAudioAt < 60 * 60 * 1000) {
-      return {
-        blob: capturedAudioBlob,
-        mime: capturedAudioMime || capturedAudioBlob.type,
-        url: capturedAudioURL,
-      };
-    }
-
-    if (!activeMedia) throw new Error("No active Read Aloud audio.");
-
-    const src = activeMedia.currentSrc || activeMedia.src || "";
-
-    if (src && blobURLMap.has(src)) {
-      const blob = blobURLMap.get(src)!;
-
-      // Touch the entry so the cache behaves as an LRU when it is pruned.
-      blobURLMap.delete(src);
-      blobURLMap.set(src, blob);
-      return { blob, mime: blob.type, url: src };
-    }
-
-    if (src) {
-      try {
-        const response = await PAGE.fetch(src, { credentials: "include" });
-
-        if (response.ok) {
-          const blob = await response.blob();
-
-          if (blob.size) {
-            return {
-              blob,
-              mime: blob.type || response.headers.get("content-type") || "",
-              url: src,
-            };
-          }
-        }
-      } catch (_) {}
-    }
-
-    throw new Error("The current Read Aloud stream was not exposed as a downloadable media response.");
-  }
-
-  async function downloadCurrentAudio(): Promise<void> {
-    if (!activeMedia || !downloadButton) return;
+  async function downloadCurrentAudio(requestedSessionId?: string): Promise<void> {
+    if (!downloadButton) return;
+    const session = captureManager.summaries().find((item) => item.id === requestedSessionId) ||
+      captureManager.summaries().find((item) => item.state === "complete");
+    if (!session) return;
 
     downloadButton.setAttribute("disabled", "true");
     downloadButton.classList.add("cgpt-ra-download-busy");
     setIcon(downloadButton, "loader-circle");
 
     try {
-      const { blob, mime, url } = await resolveDownloadBlob();
-
-      const ext = extensionFor(mime || blob.type, url);
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-      const filename = `chatgpt-read-aloud-${timestamp}.${ext}`;
+      const blob = await captureManager.blobForSession(session.id);
+      const extension = session.parts[0]?.extension || "aac";
+      const base = session.parts[0]?.filenameBase || "chatgpt";
+      const filename = `${base}-read-aloud.${extension}`;
 
       const objectURL = URL.createObjectURL(blob);
       const link = document.createElement("a");
@@ -1460,7 +1672,7 @@ import { getTranslations } from "../shared/i18n";
 
       setTimeout(() => URL.revokeObjectURL(objectURL), 5000);
 
-      log("Downloaded audio:", filename, blob.size, mime);
+      debugCapture("downloaded complete session", filename, blob.size);
     } catch (error) {
       warn("Download failed:", error);
       alert(getI18n().content.alerts.downloadError);
@@ -2018,6 +2230,16 @@ import { getTranslations } from "../shared/i18n";
 
     window.addEventListener("resize", scheduleLayoutSync, { passive: true });
     window.addEventListener("scroll", scheduleLayoutSync, { passive: true });
+    document.addEventListener(
+      "click",
+      (event) => {
+        const target = event.target instanceof Element ? event.target.closest("button, [role='menuitem'], [role='option']") : null;
+        if (target && !target.classList.contains("cgpt-inline-readaloud") && isReadAloudControl(target)) {
+          beginUserReadAloudSession();
+        }
+      },
+      true,
+    );
 
     window.setInterval(() => {
       installInlineReadAloudButtons();
@@ -2033,6 +2255,7 @@ import { getTranslations } from "../shared/i18n";
 
   function installEarlyHooks(): void {
     installObjectURLInterceptor();
+    installMediaSourceInstrumentation();
     installFetchInterceptor();
     installXHRInterceptor();
     installMediaInterceptor();

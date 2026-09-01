@@ -9,6 +9,7 @@ import { DEFAULT_SETTINGS, EXTENSION_VERSION } from "../shared/constants";
 import { ExtensionSettings } from "../shared/types";
 import { useTranslation } from "../shared/i18n";
 import { ExternalLink, Sparkles } from "lucide-react";
+import { CapturesPanel } from "./components/CapturesPanel";
 import "./styles/popup.css";
 
 export const App: React.FC = () => {
@@ -103,7 +104,10 @@ export const App: React.FC = () => {
 
       <main style={{ flex: 1, display: "flex", flexDirection: "column" }}>
         {activeTab === "controls" && (
-          <QuickControls settings={settings} onUpdateSettings={handleUpdateSettings} t={t} />
+          <>
+            <CapturesPanel />
+            <QuickControls settings={settings} onUpdateSettings={handleUpdateSettings} t={t} />
+          </>
         )}
         {activeTab === "shortcuts" && <ShortcutsDrawer t={t} />}
         {activeTab === "about" && <AboutTab t={t} />}
