@@ -58,6 +58,7 @@ import { ReadAloudSessionManager } from "./capture/session-manager";
   const lastLoggedCaptureBytes = new Map<string, number>();
   const mediaSourceIds = new WeakMap<object, string>();
   const sourceBufferMediaSourceIds = new WeakMap<object, string>();
+  const mediaSourceTerminalState = new Map<string, "normal" | "error">();
   let mediaSourceSequence = 0;
   const lastMediaTelemetryAt = new WeakMap<HTMLMediaElement, number>();
 
@@ -504,6 +505,7 @@ import { ReadAloudSessionManager } from "./capture/session-manager";
     const current = captureManager.currentSession();
     if (current?.state === "receiving") return;
     const session = captureManager.begin(currentCaptureTitle());
+    mediaSourceTerminalState.clear();
     captureDiagnostics.clear();
     recordCaptureDiagnostic("session-start", { sessionId: session.id, title: session.title });
     publishCaptureState();
@@ -556,6 +558,20 @@ import { ReadAloudSessionManager } from "./capture/session-manager";
       }
     }
     updateCaptureUI();
+  }
+
+  /**
+   * A normal MediaSource sourceended event means ChatGPT has finished appending
+   * media bytes. It is deliberately distinct from HTMLAudioElement.ended,
+   * which only describes playback position. Network and decode end states can
+   * also raise sourceended, so they explicitly leave the session interrupted.
+   */
+  function completeSessionWhenMediaHasEnded(): void {
+    const session = captureManager.currentSession();
+    if (!session || session.state !== "waiting") return;
+    if (![...mediaSourceTerminalState.values()].some((state) => state === "normal")) return;
+    if ([...mediaSourceTerminalState.values()].some((state) => state === "error")) return;
+    captureManager.completeCurrentSession();
   }
 
   function installObjectURLInterceptor(): void {
@@ -611,6 +627,10 @@ import { ReadAloudSessionManager } from "./capture/session-manager";
     debugCapture(`${id} observed`, { readyState: source.readyState });
     ["sourceopen", "sourceended", "sourceclose"].forEach((eventName) => {
       source.addEventListener(eventName, () => {
+        if (eventName === "sourceended" && !mediaSourceTerminalState.has(id)) {
+          mediaSourceTerminalState.set(id, "normal");
+          completeSessionWhenMediaHasEnded();
+        }
         recordCaptureDiagnostic(`media-source-${eventName}`, { id, readyState: source.readyState });
         publishCaptureState();
         debugCapture(`${id} ${eventName}`, { readyState: source.readyState });
@@ -635,9 +655,15 @@ import { ReadAloudSessionManager } from "./capture/session-manager";
           return buffer;
         };
         sourceProto.endOfStream = function (this: MediaSource, ...args: any[]) {
+          const id = mediaSourceId(this);
+          const endReason = typeof args[0] === "string" ? args[0] : null;
+          if (endReason) {
+            mediaSourceTerminalState.set(id, "error");
+            captureManager.interruptCurrentSession(`MediaSource ended with ${endReason}.`);
+          }
           recordCaptureDiagnostic("media-source-end-of-stream", {
-            id: mediaSourceId(this),
-            error: typeof args[0] === "string" ? args[0] : null,
+            id,
+            error: endReason,
           });
           publishCaptureState();
           debugCapture(`${mediaSourceId(this)} endOfStream`, args[0] || "ok");
@@ -717,6 +743,7 @@ import { ReadAloudSessionManager } from "./capture/session-manager";
                   error: updated.error,
                 });
               }
+              completeSessionWhenMediaHasEnded();
               publishCaptureState();
             });
           }
