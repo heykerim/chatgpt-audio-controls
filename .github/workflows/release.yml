@@ -2,15 +2,8 @@ name: CI & Release
 
 on:
   push:
-    branches:
-      - master
-      - develop
     tags:
       - "v*"
-  pull_request:
-    branches:
-      - master
-      - develop
   workflow_dispatch:
     inputs:
       publish_to_stores:
