@@ -611,3 +611,18 @@ input:checked + .slider-toggle:before {
 .secondary-links a:hover {
   color: var(--accent);
 }
+ .captures-panel {
+  margin: 0 14px 10px;
+  padding: 10px;
+  border: 1px solid var(--border-color, rgba(127, 127, 127, .25));
+  border-radius: 10px;
+}
+
+.captures-heading { font-size: 11px; font-weight: 700; margin-bottom: 7px; }
+.captures-empty { margin: 0; color: var(--text-muted); font-size: 11px; line-height: 1.4; }
+.capture-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 0; }
+.capture-copy { min-width: 0; display: grid; gap: 2px; }
+.capture-copy strong { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.capture-copy span { color: var(--text-muted); font-size: 10px; }
+.capture-item button { border: 0; border-radius: 6px; background: var(--accent-primary, #10a37f); color: white; cursor: pointer; font-size: 10px; padding: 5px 7px; }
+.capture-item button:disabled { cursor: default; opacity: .45; }

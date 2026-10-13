@@ -103,6 +103,18 @@ html.light #cgpt-ra-floating-toggle,
     overflow: visible;
 }
 
+.cgpt-ra-capture-status {
+    max-width: 100%;
+    margin-top: -5px;
+    overflow: hidden;
+    color: var(--cgpt-ra-muted);
+    font-family: system-ui, sans-serif;
+    font-size: 9.5px;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 /* Transport controls live in the right rail beside speed/volume controls. */
 .cgpt-ra-transport-row {
     position: static;
