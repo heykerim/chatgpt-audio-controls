@@ -27,7 +27,8 @@
     "open_in_tab": true
   },
   "permissions": [
-    "storage"
+    "storage",
+    "activeTab"
   ],
   "content_scripts": [
     {
