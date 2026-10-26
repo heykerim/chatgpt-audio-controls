@@ -5,6 +5,7 @@ import { ReadAloudSessionManager } from "./session-manager";
 import { inspectAdts } from "./adts";
 import { displayedAudioDuration, playerLayoutMode } from "../player-layout";
 import type { ChunkStore } from "./indexed-chunk-store";
+import { batchPrompt, batchTextsMatch, splitReadAloudText } from "./batch";
 
 class MemoryChunkStore implements ChunkStore {
   readonly chunks = new Map<string, Uint8Array[]>();
@@ -57,6 +58,19 @@ function splitBytes(bytes: Uint8Array, offsets: number[]): Uint8Array[] {
 }
 
 describe("Read Aloud capture model", () => {
+  test("splits long text at natural boundaries below the batch limit", () => {
+    const text = Array.from({ length: 500 }, (_, index) => `Paragraph ${index}. ${"word ".repeat(20)}`).join("\n\n");
+    const chunks = splitReadAloudText(text, 4_000);
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every((chunk) => chunk.length <= 4_000)).toBe(true);
+    expect(chunks.join("\n\n").replace(/\s+/g, " ").trim()).toBe(text.replace(/\s+/g, " ").trim());
+  });
+
+  test("verifies exact ChatGPT echo text and builds a bounded prompt", () => {
+    expect(batchTextsMatch("One\r\nTwo", "One\nTwo")).toBe(true);
+    expect(batchTextsMatch("One two", "One too")).toBe(false);
+    expect(batchPrompt("Exact text", 1, 5)).toContain("part 2 of 5");
+  });
   test("shows the verified full capture duration instead of the short MediaSource window", () => {
     expect(displayedAudioDuration(205, 3148.885333)).toBeCloseTo(3148.885333, 6);
   });
