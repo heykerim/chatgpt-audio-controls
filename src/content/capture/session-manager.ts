@@ -198,6 +198,26 @@ export class ReadAloudSessionManager {
     return new Blob(blobParts, { type: session.parts[0].contentType || "audio/aac" });
   }
 
+  async blobForSessions(sessionIds: string[]): Promise<Blob> {
+    const sessions = sessionIds.map((id) => this.sessions.get(id));
+    if (!sessions.length || sessions.some((session) => !session || (session.state !== "complete" && session.state !== "partial"))) {
+      throw new Error("Every Read Aloud batch part must be captured before joining.");
+    }
+
+    const captures = sessions.flatMap((session) => session?.parts || []);
+    const partChunks = await Promise.all(captures.map((part) => this.store.getAll(part.id)));
+    const inspections = partChunks.map(inspectAdts);
+    const signatures = new Set(inspections.map((inspection) => inspection.signature));
+    if (inspections.some((inspection) => !inspection.valid) || signatures.size !== 1) {
+      throw new Error("The batch audio parts are not compatible AAC/ADTS streams.");
+    }
+
+    const blobParts = partChunks.flat().map((chunk) =>
+      chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength) as ArrayBuffer,
+    );
+    return new Blob(blobParts, { type: captures[0]?.contentType || "audio/aac" });
+  }
+
   private sessionForPart(partId: string): ReadAloudSession | undefined {
     const sessionId = this.partToSession.get(partId);
     return sessionId ? this.sessions.get(sessionId) : undefined;
